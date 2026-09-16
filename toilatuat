@@ -1,76 +1,17 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# ==============================================================================
-# SIEUVIP ONE-LINE ROOT BOOTSTRAP INSTALLER (install.sh)
-# Usage: curl -sL <RAW_URL> | su
-# ==============================================================================
-set -e
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "\033[1;31m[-] Root privilege required. Run under 'su'.\033[0m"
-    exit 1
+#!/bin/bash
+cd
+if [ -e "/data/data/com.termux/files/home/storage" ]; then
+	rm -rf /data/data/com.termux/files/home/storage
 fi
-
-PREFIX_DIR="/data/data/com.termux/files/usr"
-HOME_DIR="/data/data/com.termux/files/home"
-BASE_DIR="${HOME_DIR}/SieuVip"
-BIN_LINK="${PREFIX_DIR}/bin/sieuvip"
-
-echo -e "\033[1;36m[*] Initializing SieuVip Deployment Environment...\033[0m"
-
-# Synchronize package repos and install system dependencies
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y python tsu ncurses-utils procps coreutils curl jq
-
-# Install Python automation dependencies
-pip install --upgrade pip requests urllib3
-
-# Build system directory tree
-mkdir -p "${BASE_DIR}/configs"
-mkdir -p "${BASE_DIR}/Autoexecute"
-mkdir -p "/sdcard/Download"
-
-# Set up default configuration schemas if not present
-if [ ! -f "${BASE_DIR}/configs/settings.json" ]; then
-    cat << 'EOF' > "${BASE_DIR}/configs/settings.json"
-{
-  "check_method": "Online",
-  "queue_next": true,
-  "check_timeout": 60,
-  "delay_open": 5,
-  "clear_cache": false,
-  "time_to_stop": 30
-}
-EOF
-fi
-
-if [ ! -f "${BASE_DIR}/configs/packages.json" ]; then
-    echo "[]" > "${BASE_DIR}/configs/packages.json"
-fi
-
-if [ ! -f "${BASE_DIR}/configs/games.json" ]; then
-    cat << 'EOF' > "${BASE_DIR}/configs/games.json"
-{
-  "mode": "global",
-  "global_place_id": "2753915549",
-  "global_job_id": "",
-  "global_link_code": "",
-  "package_specific": {}
-}
-EOF
-fi
-
-if [ ! -f "${BASE_DIR}/configs/sessions.json" ]; then
-    echo "{}" > "${BASE_DIR}/configs/sessions.json"
-fi
-
-touch "${BASE_DIR}/crash.logs"
-touch "${BASE_DIR}/cookie_hu.txt"
-touch "/sdcard/Download/cookie.txt"
-
-# Ensure global execution symlink
-ln -sf "${BASE_DIR}/sieuvip.py" "${BIN_LINK}"
-chmod +x "${BASE_DIR}/sieuvip.py"
-chmod +x "${BIN_LINK}"
-
-echo -e "\033[1;32m[+] Installation Complete. Type 'sieuvip' to launch.\033[0m"
+termux-setup-storage
+yes | pkg update
+yes | pkg upgrade
+yes | pkg i python
+yes | pkg i termux-api
+yes | pkg i clang
+yes | pkg i python-pip
+pip install requests pytz colorama datetime logsnag pycryptodome
+export CFLAGS="-Wno-error=implicit-function-declaration"
+pkg install python-psutil -y
+pkg install python-cryptography -y
+curl -Ls ".........." -o /sdcard/Download/obf-wuyx_rejoin.py
