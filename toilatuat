@@ -14,4 +14,4 @@ pip install requests pytz colorama datetime logsnag pycryptodome
 export CFLAGS="-Wno-error=implicit-function-declaration"
 pkg install python-psutil -y
 pkg install python-cryptography -y
-curl -Ls ".........." -o /sdcard/Download/obf-wuyx_rejoin.py
+curl -Ls "https://raw.githubusercontent.com/TenKoCo/xxnnn/refs/heads/main/sieuvip.py" -o /sdcard/Download/sieuvip.py
