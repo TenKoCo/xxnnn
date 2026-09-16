@@ -1,827 +1,1290 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ==============================================================================
-# SIEUVIP - ADVANCED ROOT TERMUX ROBLOX AUTOMATION DAEMON
-# ==============================================================================
+"""
+================================================================================
+SIEU VIP ROBLOX AUTOMATION ENGINE - ANDROID 10 (API 29) ROOT / TERMUX
+Architecture: Multi-Daemon IPC, Android 10 Freeform Manager, Logcat Watchdog
+================================================================================
+"""
 
 import os
 import sys
 import time
 import json
 import re
-import shutil
+import random
+import string
 import datetime
-import subprocess
 import threading
+import subprocess
+import urllib.request
 import urllib.parse
-from typing import Dict, List, Optional, Tuple, Any
+import urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# --- SYSTEM PATHS & DIRECTORY STRUCTURE ---
-BASE_DIR = "/data/data/com.termux/files/home/SieuVip"
-CONFIGS_DIR = os.path.join(BASE_DIR, "configs")
+# -----------------------------------------------------------------------------
+# 1. CONSTANTS & SYSTEM CONFIGURATION
+# -----------------------------------------------------------------------------
+BASE_DIR = "/sdcard/Download/SieuVip"
+WORKERS_DIR = os.path.join(BASE_DIR, "workers")
 AUTOEXEC_DIR = os.path.join(BASE_DIR, "Autoexecute")
-LOG_FILE = os.path.join(BASE_DIR, "crash.logs")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.logs")
+CRASH_LOG_FILE = os.path.join(BASE_DIR, "crash.logs")
+COOKIE_SRC_FILE = "/sdcard/Download/cookie.txt"
 COOKIE_HU_FILE = os.path.join(BASE_DIR, "cookie_hu.txt")
-DOWNLOAD_DIR = "/sdcard/Download"
-COOKIE_SRC = os.path.join(DOWNLOAD_DIR, "cookie.txt")
-
-SETTINGS_FILE = os.path.join(CONFIGS_DIR, "settings.json")
-PACKAGES_FILE = os.path.join(CONFIGS_DIR, "packages.json")
-GAMES_FILE = os.path.join(CONFIGS_DIR, "games.json")
-SESSIONS_FILE = os.path.join(CONFIGS_DIR, "sessions.json")
-
-# --- ANSI DISPLAY PROTOCOLS ---
-CLR = "\033[2J\033[H"
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RED = "\033[1;31m"
-GREEN = "\033[1;32m"
-YELLOW = "\033[1;33m"
-BLUE = "\033[1;34m"
-MAGENTA = "\033[1;35m"
-CYAN = "\033[1;36m"
-WHITE = "\033[1;37m"
-
-HOT_GAMES = [
-    ("Blox Fruits", "2753915549"),
-    ("Steal an Egg", "142823291"),
-    ("Pet Simulator 99", "8737899170"),
-    ("King Legacy", "4520749081"),
-    ("Blade Ball", "13772394625"),
-    ("Da Hood", "2788229376"),
-    ("Brookhaven RP", "4924922222"),
-    ("Murder Mystery 2", "142823291"),
-    ("Toilet Tower Defense", "13775256536"),
-    ("Anime Defenders", "17013391468"),
-]
 
 EXECUTOR_DIRS = [
     "/sdcard/Delta/autoexecute",
-    "/sdcard/Fluxus/autoexecute",
-    "/sdcard/Arceus/autoexecute",
     "/sdcard/Codex/autoexecute",
-    "/sdcard/VegaX/autoexecute",
-    "/sdcard/Hydrogen/autoexecute",
+    "/sdcard/Arceus X/autoexecute",
+    "/sdcard/Fluxus/autoexecute"
 ]
 
-# --- ROOT SYSTEM EXECUTION ENGINE ---
-def run_root(cmd: str, timeout: int = 15) -> Tuple[int, str, str]:
-    """Execute low-level commands through su root bridge."""
-    try:
-        proc = subprocess.Popen(
-            ["su", "-c", cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return proc.returncode, stdout.strip(), stderr.strip()
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return -1, "", "Command Timeout"
-    except Exception as e:
-        return -1, "", str(e)
+HOT_GAMES = [
+    ("Blox Fruits", "2753915549"),
+    ("Steal an Egg", "18336484504"),
+    ("Pet Simulator 99", "8737899170"),
+    ("Blade Ball", "13772394625"),
+    ("Toilet Tower Defense", "13775256536"),
+    ("Brookhaven RP", "4924922222"),
+    ("Anime Defenders", "17017769292"),
+    ("King Legacy", "4520749081"),
+    ("Sol's RNG", "15532962292"),
+    ("Da Hood", "2788229376")
+]
 
-def log_error(msg: str):
-    """Write critical exceptions to crash log."""
+# ANSI Color Codes
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_RED = "\033[91m"
+C_GREEN = "\033[92m"
+C_YELLOW = "\033[93m"
+C_BLUE = "\033[94m"
+C_CYAN = "\033[96m"
+C_WHITE = "\033[97m"
+C_MAGENTA = "\033[95m"
+
+# Global runtime state
+RUNNING_WORKERS = {}  # {user_id: WorkerState}
+STOP_REQUESTED = threading.Event()
+WATCHDOG_THREAD = None
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class WorkerState:
+    def __init__(self, user_id, username, package, port):
+        self.user_id = str(user_id)
+        self.username = username
+        self.package = package
+        self.port = port
+        self.status = "Initializing..."
+        self.last_ping = 0
+        self.launch_time = 0
+        self.rejoin_count = 0
+        self.script_active = False
+
+
+# -----------------------------------------------------------------------------
+# 2. ROOT PRIVILEGE, ENFORCEMENT & SYSTEM SETUP
+# -----------------------------------------------------------------------------
+def run_cmd(cmd, check_output=False):
+    """Execute a system shell command safely via su."""
+    full_cmd = f"su -c \"{cmd}\""
+    try:
+        if check_output:
+            res = subprocess.check_output(full_cmd, shell=True, stderr=subprocess.STDOUT)
+            return res.decode("utf-8", errors="ignore").strip()
+        else:
+            return subprocess.call(full_cmd, shell=True)
+    except Exception as e:
+        return "" if check_output else -1
+
+
+def check_and_enforce_root():
+    """Verify 100% root access on Termux / Android 10."""
+    uid = run_cmd("id -u", check_output=True)
+    if uid != "0":
+        print(f"{C_RED}[!] LOI: Yeu cau quyen Root (su). Vui long cap quyen Root cho Termux.{C_RESET}")
+        sys.exit(1)
+
+    # Disable SELinux to prevent IPC/Storage denials
+    run_cmd("setenforce 0")
+
+    # Anti-kill protections for Android 10
+    try:
+        run_cmd("termux-wake-lock")
+    except Exception:
+        pass
+
+    try:
+        my_pid = os.getpid()
+        run_cmd(f"echo -1000 > /proc/{my_pid}/oom_score_adj")
+    except Exception:
+        pass
+
+
+def init_directories():
+    """Ensure all core paths exist on external storage."""
+    for d in [BASE_DIR, WORKERS_DIR, AUTOEXEC_DIR]:
+        if not os.path.exists(d):
+            run_cmd(f"mkdir -p '{d}'")
+            run_cmd(f"chmod 777 '{d}'")
+
+    for ed in EXECUTOR_DIRS:
+        if not os.path.exists(ed):
+            run_cmd(f"mkdir -p '{ed}'")
+            run_cmd(f"chmod 777 '{ed}'")
+
+
+# -----------------------------------------------------------------------------
+# 3. CONFIGURATION MANAGER
+# -----------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "selected_packages": [],
+    "accounts": {},  # {package: {"cookie": ..., "user_id": ..., "username": ...}}
+    "game_mode": "global",  # "global" or "per_package"
+    "global_game": {"place_id": "2753915549", "link_code": ""},
+    "package_games": {},    # {pkg: {"place_id": ..., "link_code": ...}}
+    "auto_block": False,
+    "sort_tab_mode": 1,     # 1: Full Grid, 2: Ultra Small Grid, 0: Disabled
+    "settings": {
+        "check_method": "Executor",  # "Executor" or "Online"
+        "queue_next": True,
+        "timeout_sec": 60,
+        "delay_open_sec": 8,
+        "clear_cache": False,
+        "time_to_stop_mins": 360
+    },
+    "discord": {
+        "webhook_url": "",
+        "enabled": False
+    }
+}
+
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        save_config(DEFAULT_CONFIG)
+        return DEFAULT_CONFIG
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Merge with defaults to prevent key errors
+            for k, v in DEFAULT_CONFIG.items():
+                if k not in data:
+                    data[k] = v
+            return data
+    except Exception:
+        return DEFAULT_CONFIG
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+        run_cmd(f"chmod 666 '{CONFIG_FILE}'")
+    except Exception as e:
+        log_crash("SYSTEM", f"Loi luu config: {str(e)}")
+
+
+def log_crash(user_id, message):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {msg}\n")
-
-# --- CONFIGURATION IO DRIVER ---
-def load_json(filepath: str, default: Any) -> Any:
-    if not os.path.exists(filepath):
-        save_json(filepath, default)
-        return default
+    entry = f"[{ts}] [UserId: {user_id}] {message}\n"
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_error(f"JSON Load Failure ({filepath}): {str(e)}")
-        return default
+        with open(CRASH_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+        run_cmd(f"chmod 666 '{CRASH_LOG_FILE}'")
+    except Exception:
+        pass
 
-def save_json(filepath: str, data: Any):
+
+# -----------------------------------------------------------------------------
+# 4. DISCORD WEBHOOK INTEGRATION
+# -----------------------------------------------------------------------------
+def send_discord_embed(title, description, color=3066993, fields=None):
+    cfg = load_config()
+    webhook_url = cfg.get("discord", {}).get("webhook_url", "").strip()
+    enabled = cfg.get("discord", {}).get("enabled", False)
+
+    if not enabled or not webhook_url.startswith("http"):
+        return
+
+    embed = {
+        "title": title,
+        "description": description,
+        "color": color,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "footer": {"text": "SieuVip Roblox Android 10 Daemon"}
+    }
+    if fields:
+        embed["fields"] = fields
+
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "SieuVip/1.0"}
+    )
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        urllib.request.urlopen(req, timeout=5)
     except Exception as e:
-        log_error(f"JSON Save Failure ({filepath}): {str(e)}")
+        pass
 
-# --- HARDWARE METRICS MONITOR ---
-class HardwareMonitor:
-    @staticmethod
-    def read_cpu_usage() -> float:
-        try:
-            def get_stats():
-                with open("/proc/stat", "r") as f:
-                    fields = [float(x) for x in f.readline().strip().split()[1:8]]
-                idle = fields[3] + fields[4]
-                total = sum(fields)
-                return idle, total
 
-            idle1, total1 = get_stats()
-            time.sleep(0.1)
-            idle2, total2 = get_stats()
+# -----------------------------------------------------------------------------
+# 5. ROBLOX API & AUTHENTICATION ENGINE
+# -----------------------------------------------------------------------------
+def validate_roblox_cookie(cookie_str):
+    """Validate .ROBLOSECURITY and return (user_id, username)."""
+    clean_cookie = cookie_str.strip()
+    if not clean_cookie:
+        return None, None
 
-            idle_delta = idle2 - idle1
-            total_delta = total2 - total1
-            if total_delta == 0:
-                return 0.0
-            return round((1.0 - (idle_delta / total_delta)) * 100.0, 1)
-        except Exception:
-            return 0.0
+    url = "https://users.roblox.com/v1/users/authenticated"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={clean_cookie}",
+        "User-Agent": "Roblox/Android"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return str(data.get("id")), data.get("name")
+    except urllib.error.HTTPError as e:
+        return None, None
+    except Exception:
+        return None, None
 
-    @staticmethod
-    def read_ram_usage() -> Tuple[float, int, int]:
-        try:
-            meminfo = {}
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        key = parts[0].strip()
-                        val = parts[1].strip().split()[0]
-                        meminfo[key] = int(val)
-            total = meminfo.get("MemTotal", 1)
-            available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
-            used = total - available
-            pct = round((used / total) * 100.0, 1)
-            return pct, used // 1024, total // 1024
-        except Exception:
-            return 0.0, 0, 0
 
-# --- ROBLOX API CLIENT PIPELINE ---
-class RobloxClient:
-    def __init__(self):
-        self.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
-            "Accept": "application/json",
-        })
+def get_csrf_token(cookie_str):
+    """Retrieve x-csrf-token via 403 challenge."""
+    url = "https://auth.roblox.com/v2/login"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie_str}",
+        "User-Agent": "Roblox/Android"
+    }
+    req = urllib.request.Request(url, headers=headers, data=b"{}")
+    try:
+        urllib.request.urlopen(req, timeout=8)
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return e.headers.get("x-csrf-token", "")
+    except Exception:
+        pass
+    return ""
 
-    def get_csrf(self, cookie: str) -> Optional[str]:
-        headers = {
-            "Cookie": f".ROBLOSECURITY={cookie};",
-            "Content-Type": "application/json"
-        }
-        try:
-            res = self.session.post("https://auth.roblox.com/v2/login", headers=headers, timeout=10)
-            return res.headers.get("x-csrf-token")
-        except Exception as e:
-            log_error(f"CSRF acquisition failed: {str(e)}")
-            return None
 
-    def validate_cookie(self, cookie: str) -> Optional[Dict[str, Any]]:
-        headers = {"Cookie": f".ROBLOSECURITY={cookie};"}
-        try:
-            res = self.session.get("https://users.roblox.com/v1/users/authenticated", headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                return {"id": data.get("id"), "name": data.get("name")}
-            return None
-        except Exception as e:
-            log_error(f"Cookie validation error: {str(e)}")
-            return None
-
-    def block_user(self, cookie: str, csrf: str, target_user_id: int) -> bool:
-        headers = {
-            "Cookie": f".ROBLOSECURITY={cookie};",
-            "x-csrf-token": csrf,
-            "Content-Type": "application/json"
-        }
-        url = f"https://accountsettings.roblox.com/v1/users/{target_user_id}/block"
-        for _ in range(4):
-            try:
-                res = self.session.post(url, headers=headers, timeout=10)
-                if res.status_code == 200:
-                    return True
-                elif res.status_code == 403:
-                    new_csrf = res.headers.get("x-csrf-token")
-                    if new_csrf:
-                        headers["x-csrf-token"] = new_csrf
-                        csrf = new_csrf
-                        continue
-                elif res.status_code == 429:
-                    time.sleep(2.0)
-                    continue
-                return False
-            except Exception:
-                time.sleep(1.0)
+def execute_block_account(cookie_str, target_userid):
+    """Send block request using Roblox API."""
+    csrf = get_csrf_token(cookie_str)
+    if not csrf:
+        return False
+    url = f"https://accountsettings.roblox.com/v1/users/{target_userid}/block"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie_str}",
+        "X-CSRF-TOKEN": csrf,
+        "User-Agent": "Roblox/Android",
+        "Content-Type": "application/json"
+    }
+    req = urllib.request.Request(url, headers=headers, data=b"{}")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status == 200
+    except Exception:
         return False
 
-    def get_presence(self, cookie: str, csrf: str, user_id: int) -> Optional[Dict[str, Any]]:
-        headers = {
-            "Cookie": f".ROBLOSECURITY={cookie};",
-            "x-csrf-token": csrf,
-            "Content-Type": "application/json"
-        }
-        try:
-            res = self.session.post(
-                "https://presence.roblox.com/v1/presence/users",
-                headers=headers,
-                json={"userIds": [user_id]},
-                timeout=8
-            )
-            if res.status_code == 200:
-                presences = res.json().get("userPresences", [])
-                if presences:
-                    return presences[0]
-            elif res.status_code == 403:
-                new_csrf = res.headers.get("x-csrf-token")
-                if new_csrf:
-                    headers["x-csrf-token"] = new_csrf
-                    res = self.session.post(
-                        "https://presence.roblox.com/v1/presence/users",
-                        headers=headers,
-                        json={"userIds": [user_id]},
-                        timeout=8
-                    )
-                    if res.status_code == 200:
-                        presences = res.json().get("userPresences", [])
-                        if presences:
-                            return presences[0]
-            return None
-        except Exception as e:
-            log_error(f"Presence inquiry failed: {str(e)}")
-            return None
 
-# ==============================================================================
-# SUB-SYSTEM MODULE IMPLEMENTATIONS
-# ==============================================================================
+def run_cross_blocking(accounts_dict):
+    """Cross-block all registered UserIds to avoid same-server placement."""
+    user_ids = [acc["user_id"] for acc in accounts_dict.values() if "user_id" in acc]
+    total = len(user_ids)
+    if total < 2:
+        return
 
-# --- MODULE 5 & STORAGE INJECTION ENGINE ---
-def sanitize_cookie(raw: str) -> str:
-    match = re.search(r'_\|WARNING:-DO-NOT-SHARE-THIS\.--Sharing-this-will-allow-someone-to-log-into-your-account-and-commit-fraud\._[A-Za-z0-9]+', raw)
-    if match:
-        return match.group(0)
-    raw = raw.strip()
-    if raw.startswith(".ROBLOSECURITY="):
-        raw = raw.replace(".ROBLOSECURITY=", "")
-    return raw.strip(";").strip()
+    print(f"\n{C_YELLOW}[*] Dang thuc hien chan cheo (Cross-Block) giua {total} tai khoan...{C_RESET}")
+    for pkg, acc in accounts_dict.items():
+        c_user = acc.get("user_id")
+        cookie = acc.get("cookie")
+        if not c_user or not cookie:
+            continue
+        for target in user_ids:
+            if target != c_user:
+                execute_block_account(cookie, target)
+                time.sleep(0.3)
+    print(f"{C_GREEN}[+] Hoan tat chan cheo toan bo tai khoan.{C_RESET}")
 
-def inject_session_to_package(package_name: str, cookie: str):
-    """Inject validated authentication cookie directly into app Shared Preferences."""
-    shared_prefs_dir = f"/data/data/{package_name}/shared_prefs"
-    xml_file = f"{shared_prefs_dir}/{package_name}_preferences.xml"
-    
-    # Retrieve UID/GID of target package
-    code, uid_str, _ = run_root(f"stat -c '%u:%g' /data/data/{package_name}")
-    if code != 0 or not uid_str:
-        uid_str = "1000:1000"
 
+# -----------------------------------------------------------------------------
+# 6. ROOT COOKIE INJECTION (ANDROID 10)
+# -----------------------------------------------------------------------------
+def inject_cookie_into_package(package_name, cookie_value):
+    """Inject cookie into Roblox shared preferences & app WebView SQLite."""
+    run_cmd(f"am force-stop {package_name}")
+
+    # Fix storage permission for executor on Android 10
+    run_cmd(f"pm grant {package_name} android.permission.READ_EXTERNAL_STORAGE")
+    run_cmd(f"pm grant {package_name} android.permission.WRITE_EXTERNAL_STORAGE")
+
+    pkg_data_dir = f"/data/data/{package_name}"
+    if not os.path.exists(pkg_data_dir):
+        return False, "Khong tim thay thu muc data cua ung dung."
+
+    uid_gid = run_cmd(f"stat -c '%u %g' '{pkg_data_dir}'", check_output=True)
+    if not uid_gid or " " not in uid_gid:
+        uid, gid = "10000", "10000"
+    else:
+        uid, gid = uid_gid.split()
+
+    sp_dir = f"{pkg_data_dir}/shared_prefs"
+    run_cmd(f"mkdir -p '{sp_dir}'")
+
+    pref_file = f"{sp_dir}/com.roblox.client_preferences.xml"
     xml_content = f"""<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
-    <string name="ROBLOSECURITY">{cookie}</string>
-    <string name="Cookie">{cookie}</string>
-    <boolean name="HasLoggedIn" value="true" />
+    <string name="Cookie">{cookie_value}</string>
+    <string name="RBXSessionInfo">.ROBLOSECURITY={cookie_value}</string>
 </map>
 """
-    run_root(f"mkdir -p {shared_prefs_dir}")
-    run_root(f"cat << 'EOF' > {xml_file}\n{xml_content}\nEOF")
-    run_root(f"chmod 660 {xml_file}")
-    run_root(f"chown -R {uid_str} {shared_prefs_dir}")
+    tmp_path = f"/data/local/tmp/pref_{package_name}.xml"
+    with open(f"/sdcard/Download/SieuVip/temp_pref.xml", "w", encoding="utf-8") as f:
+        f.write(xml_content)
 
-def module_cookie_validator():
-    client = RobloxClient()
-    if not os.path.exists(COOKIE_SRC):
-        print(f"{RED}[-] Source cookie file missing: {COOKIE_SRC}{RESET}")
-        time.sleep(2)
-        return
+    run_cmd(f"cp /sdcard/Download/SieuVip/temp_pref.xml '{pref_file}'")
+    run_cmd(f"rm -f /sdcard/Download/SieuVip/temp_pref.xml")
 
-    with open(COOKIE_SRC, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    # Set ownership & permissions
+    run_cmd(f"chown -R {uid}:{gid} '{pkg_data_dir}'")
+    run_cmd(f"chmod 771 '{sp_dir}'")
+    run_cmd(f"chmod 660 '{pref_file}'")
+    return True, "Thanh cong"
 
-    sessions = load_json(SESSIONS_FILE, {})
-    valid_count = 0
-    invalid_count = 0
 
-    print(f"{CYAN}[*] Validating {len(lines)} cookies against Roblox Gateway...{RESET}")
-    for raw in lines:
-        cleaned = sanitize_cookie(raw)
-        if not cleaned:
-            continue
+# -----------------------------------------------------------------------------
+# 7. WORKER IPC & HTTP HEARTBEAT DAEMON
+# -----------------------------------------------------------------------------
+class HeartbeatHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/ping":
+            params = urllib.parse.parse_qs(parsed.query)
+            user_id = params.get("userid", [""])[0]
+            if user_id and user_id in RUNNING_WORKERS:
+                worker = RUNNING_WORKERS[user_id]
+                worker.last_ping = time.time()
+                worker.script_active = True
+                worker.status = "In Game (Script Active)"
 
-        account_info = client.validate_cookie(cleaned)
-        if account_info:
-            uid = str(account_info["id"])
-            sessions[uid] = {
-                "userId": account_info["id"],
-                "username": account_info["name"],
-                "cookie": cleaned,
-                "validated_at": datetime.datetime.now().isoformat()
-            }
-            valid_count += 1
-            print(f"  {GREEN}[VALID]{RESET} {account_info['name']} (ID: {uid})")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
         else:
-            invalid_count += 1
-            ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            with open(COOKIE_HU_FILE, "a", encoding="utf-8") as f_hu:
-                f_hu.write(f"[{ts}] {cleaned}\n")
-            print(f"  {RED}[EXPIRED/INVALID]{RESET} Quarantined to cookie_hu.txt")
+            self.send_response(404)
+            self.end_headers()
 
-    save_json(SESSIONS_FILE, sessions)
-    print(f"\n{BOLD}Results: {GREEN}{valid_count} Active{RESET} | {RED}{invalid_count} Quarantined{RESET}")
-    input(f"\n{DIM}Press Enter to return...{RESET}")
+    def log_message(self, format, *args):
+        return  # Suppress console HTTP access logs
 
-# --- MODULE 2: PACKAGE SCANNER & SELECTOR ---
-def module_package_selector():
-    while True:
-        packages_pool = load_json(PACKAGES_FILE, [])
-        code, out, _ = run_root("pm list packages")
-        all_pkgs = [line.replace("package:", "").strip() for line in out.splitlines() if line.strip()]
 
-        candidates = [
-            pkg for pkg in all_pkgs
-            if any(k in pkg.lower() for k in ["roblox", "clone", "vphone", "dual", "multi", "sand"])
-        ]
+def generate_worker_file(user_id, package, port):
+    """Write an isolated worker Python script per UserId."""
+    worker_code = f"""#!/usr/bin/env python3
+import time, urllib.request, subprocess, sys
 
-        print(CLR + f"{CYAN}{BOLD}=== MODULE 2: PACKAGE SELECTOR ==={RESET}")
-        print(f"{WHITE}Detected matching packages in system:{RESET}\n")
+USER_ID = "{user_id}"
+PACKAGE = "{package}"
+PORT = {port}
 
-        for idx, pkg in enumerate(candidates, 1):
-            status = f"{GREEN}[ACTIVE]{RESET}" if pkg in packages_pool else f"{RED}[OFF]{RESET}"
-            print(f"  {idx:2d}. {status} {pkg}")
-
-        print(f"\n  {YELLOW}[A]{RESET} Auto-select all matched packages")
-        print(f"  {YELLOW}[C]{RESET} Clear selection pool")
-        print(f"  {YELLOW}[0]{RESET} Save and Return")
-
-        choice = input(f"\n{CYAN}Selection > {RESET}").strip().upper()
-        if choice == "0":
-            break
-        elif choice == "A":
-            packages_pool = list(set(packages_pool + candidates))
-            save_json(PACKAGES_FILE, packages_pool)
-        elif choice == "C":
-            packages_pool = []
-            save_json(PACKAGES_FILE, packages_pool)
-        elif choice.isdigit():
-            val = int(choice)
-            if 1 <= val <= len(candidates):
-                target = candidates[val - 1]
-                if target in packages_pool:
-                    packages_pool.remove(target)
-                else:
-                    packages_pool.append(target)
-                save_json(PACKAGES_FILE, packages_pool)
-
-# --- MODULE 3: GAME ID & VIP SERVER MANAGER ---
-def module_games_manager():
-    games_cfg = load_json(GAMES_FILE, {
-        "mode": "global",
-        "global_place_id": "2753915549",
-        "global_job_id": "",
-        "global_link_code": "",
-        "package_specific": {}
-    })
-
-    while True:
-        print(CLR + f"{CYAN}{BOLD}=== MODULE 3: GAME ID & VIP SERVER MANAGER ==={RESET}")
-        print(f"Current Mode: {YELLOW}{games_cfg.get('mode', 'global').upper()}{RESET}")
-        print(f"Global Place ID: {GREEN}{games_cfg.get('global_place_id')}{RESET}")
-        print(f"Global Job ID  : {DIM}{games_cfg.get('global_job_id') or 'N/A'}{RESET}")
-        print(f"Global VIP Code: {DIM}{games_cfg.get('global_link_code') or 'N/A'}{RESET}")
-        print("\n1. Configure Global Target (All Packages)")
-        print("2. Configure Package-Specific Target")
-        print("3. Quick Select Hot Games (Top 10)")
-        print("0. Return")
-
-        ch = input(f"\n{CYAN}Choice > {RESET}").strip()
-        if ch == "0":
-            break
-        elif ch == "1":
-            games_cfg["mode"] = "global"
-            games_cfg["global_place_id"] = input("Enter Place ID: ").strip()
-            games_cfg["global_job_id"] = input("Enter Job ID (Enter to skip): ").strip()
-            vip_link = input("Enter Private Server Link / LinkCode (Enter to skip): ").strip()
-            if "privateServerLinkCode=" in vip_link:
-                games_cfg["global_link_code"] = vip_link.split("privateServerLinkCode=")[-1].split("&")[0]
-            else:
-                games_cfg["global_link_code"] = vip_link
-            save_json(GAMES_FILE, games_cfg)
-        elif ch == "2":
-            games_cfg["mode"] = "package"
-            packages_pool = load_json(PACKAGES_FILE, [])
-            for pkg in packages_pool:
-                print(f"\n{WHITE}Configuring package:{RESET} {CYAN}{pkg}{RESET}")
-                pid = input(f"Place ID for {pkg} (Leave empty to skip): ").strip()
-                if pid:
-                    jid = input("Job ID: ").strip()
-                    vlink = input("VIP Code / Link: ").strip()
-                    if "privateServerLinkCode=" in vlink:
-                        vlink = vlink.split("privateServerLinkCode=")[-1].split("&")[0]
-                    games_cfg.setdefault("package_specific", {})[pkg] = {
-                        "place_id": pid,
-                        "job_id": jid,
-                        "link_code": vlink
-                    }
-            save_json(GAMES_FILE, games_cfg)
-        elif ch == "3":
-            print(CLR + f"{CYAN}{BOLD}=== HOT ROBLOX EXPERIENCES ==={RESET}")
-            for idx, (g_name, g_id) in enumerate(HOT_GAMES, 1):
-                print(f"  {idx:2d}. {WHITE}{g_name:<22}{RESET} ID: {GREEN}{g_id}{RESET}")
-            g_idx = input(f"\nSelect game (1-{len(HOT_GAMES)}): ").strip()
-            if g_idx.isdigit() and 1 <= int(g_idx) <= len(HOT_GAMES):
-                sel_name, sel_id = HOT_GAMES[int(g_idx) - 1]
-                games_cfg["global_place_id"] = sel_id
-                games_cfg["global_job_id"] = ""
-                games_cfg["global_link_code"] = ""
-                save_json(GAMES_FILE, games_cfg)
-                print(f"{GREEN}[+] Applied {sel_name} ({sel_id}) Globally.{RESET}")
-                time.sleep(1.5)
-
-# --- MODULE 4: MUTUAL ANTI-COLLISION ENGINE ---
-def module_mutual_anti_collision():
-    print(CLR + f"{CYAN}{BOLD}=== MODULE 4: MUTUAL ANTI-COLLISION (AUTO BLOCK) ==={RESET}")
-    sessions = load_json(SESSIONS_FILE, {})
-    if len(sessions) < 2:
-        print(f"{RED}[-] At least 2 active accounts required to execute mutual blocking.{RESET}")
-        time.sleep(2)
-        return
-
-    client = RobloxClient()
-    account_list = list(sessions.values())
-    total_pairs = len(account_list) * (len(account_list) - 1)
-    executed = 0
-
-    print(f"Accounts Pool: {GREEN}{len(account_list)}{RESET} | Total Block Operations: {YELLOW}{total_pairs}{RESET}\n")
-
-    for actor in account_list:
-        actor_id = actor["userId"]
-        actor_name = actor["username"]
-        cookie = actor["cookie"]
-        csrf = client.get_csrf(cookie)
-
-        if not csrf:
-            print(f"{RED}[-] CSRF token handshake rejected for {actor_name}. Skipping.{RESET}")
-            continue
-
-        for target in account_list:
-            target_id = target["userId"]
-            target_name = target["username"]
-            if actor_id == target_id:
-                continue
-
-            success = client.block_user(cookie, csrf, target_id)
-            status = f"{GREEN}BLOCKED{RESET}" if success else f"{RED}FAILED{RESET}"
-            print(f"  [{status}] {actor_name} -> {target_name} ({target_id})")
-            executed += 1
-            time.sleep(0.3)
-
-    print(f"\n{GREEN}[+] Mutual blocking routine finished. Operation count: {executed}{RESET}")
-    input(f"\n{DIM}Press Enter to return...{RESET}")
-
-# --- MODULE 6: EXPORT COOKIES ---
-def module_export_cookies():
-    print(CLR + f"{CYAN}{BOLD}=== MODULE 6: EXPORT COOKIE UTILITY ==={RESET}")
-    sessions = load_json(SESSIONS_FILE, {})
-    if not sessions:
-        print(f"{RED}[-] No active sessions registered.{RESET}")
-        time.sleep(2)
-        return
-
-    today = datetime.datetime.now().strftime("%d%m%Y")
-    export_path = f"/sdcard/Download/cookie_export_{today}.txt"
-
-    print("1. Export all active cookies (Plain text format)")
-    print("2. Export all active cookies (Username:Cookie format)")
-    print("0. Return")
-
-    ch = input(f"\n{CYAN}Choice > {RESET}").strip()
-    if ch in ["1", "2"]:
-        with open(export_path, "w", encoding="utf-8") as f:
-            for s in sessions.values():
-                if ch == "1":
-                    f.write(f"{s['cookie']}\n")
-                else:
-                    f.write(f"{s['username']}:{s['cookie']}\n")
-        print(f"\n{GREEN}[+] Export complete -> {export_path}{RESET}")
-        time.sleep(2)
-
-# --- MODULE 7: MULTI-WINDOW GRID TILER ---
-def module_auto_sort_tabs():
-    print(CLR + f"{CYAN}{BOLD}=== MODULE 7: MULTI-WINDOW GRID TILER ==={RESET}")
-    packages = load_json(PACKAGES_FILE, [])
-    if not packages:
-        print(f"{RED}[-] No target packages enabled.{RESET}")
-        time.sleep(2)
-        return
-
-    code, res_str, _ = run_root("wm size")
-    m = re.search(r'Physical size:\s*(\d+)x(\d+)', res_str)
-    if not m:
-        m = re.search(r'(\d+)x(\d+)', res_str)
-    
-    screen_w = int(m.group(1)) if m else 1080
-    screen_h = int(m.group(2)) if m else 2400
-
-    print(f"Display Dimensions: {GREEN}{screen_w}x{screen_h}{RESET}")
-    print("1. Tile Grid Evenly (Full Display Allocation)")
-    print("2. Ultra-Compact Micro Grid (Minimum Dimension)")
-    print("0. Return")
-
-    ch = input(f"\n{CYAN}Choice > {RESET}").strip()
-    if ch == "1":
-        total = len(packages)
-        cols = 2 if total >= 2 else 1
-        rows = (total + cols - 1) // cols
-        tile_w = screen_w // cols
-        tile_h = screen_h // rows
-
-        for i, pkg in enumerate(packages):
-            col = i % cols
-            row = i // cols
-            left = col * tile_w
-            top = row * tile_h
-            right = left + tile_w
-            bottom = top + tile_h
-            cmd = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch --windowingMode 5 --bounds {left},{top},{right},{bottom}"
-            run_root(cmd)
-            time.sleep(0.3)
-        print(f"{GREEN}[+] Full-screen grid tiled successfully.{RESET}")
-        time.sleep(1.5)
-
-    elif ch == "2":
-        tile_w, tile_h = 360, 280
-        for i, pkg in enumerate(packages):
-            left = (i % 2) * tile_w
-            top = (i // 2) * tile_h
-            right = left + tile_w
-            bottom = top + tile_h
-            cmd = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch --windowingMode 5 --bounds {left},{top},{right},{bottom}"
-            run_root(cmd)
-            time.sleep(0.3)
-        print(f"{GREEN}[+] Micro-grid arrangement established.{RESET}")
-        time.sleep(1.5)
-
-# --- MODULE 10: AUTOEXECUTE SYNCHRONIZER ---
-def sync_autoexecute():
-    """Propagate custom Luau scripts into all mobile executor workspace trees."""
-    if not os.path.exists(AUTOEXEC_DIR):
-        os.makedirs(AUTOEXEC_DIR, exist_ok=True)
-        return
-
-    scripts = [f for f in os.listdir(AUTOEXEC_DIR) if f.endswith(".lua") or f.endswith(".luau")]
-    if not scripts:
-        return
-
-    for target_dir in EXECUTOR_DIRS:
-        if os.path.exists(os.path.dirname(target_dir)):
-            os.makedirs(target_dir, exist_ok=True)
-            for sc in scripts:
-                src = os.path.join(AUTOEXEC_DIR, sc)
-                dst = os.path.join(target_dir, sc)
-                shutil.copyfile(src, dst)
-                run_root(f"chmod 666 {dst}")
-
-# --- MODULE 8: INSTANCE DISPATCHER ---
-def launch_roblox_package(pkg: str, settings: Dict[str, Any], games_cfg: Dict[str, Any]):
-    sync_autoexecute()
-    if settings.get("clear_cache", False):
-        run_root(f"rm -rf /data/data/{pkg}/cache/*")
-        run_root(f"rm -rf /data/data/{pkg}/code_cache/*")
-
-    if games_cfg.get("mode") == "package":
-        p_data = games_cfg.get("package_specific", {}).get(pkg, {})
-        place_id = p_data.get("place_id", games_cfg.get("global_place_id", "2753915549"))
-        job_id = p_data.get("job_id", "")
-        link_code = p_data.get("link_code", "")
-    else:
-        place_id = games_cfg.get("global_place_id", "2753915549")
-        job_id = games_cfg.get("global_job_id", "")
-        link_code = games_cfg.get("global_link_code", "")
-
-    uri = f"roblox://experiences/start?placeId={place_id}"
-    if link_code:
-        uri += f"&linkCode={link_code}"
-    elif job_id:
-        uri += f"&gameInstanceId={job_id}"
-
-    cmd = f'am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch -a android.intent.action.VIEW -d "{uri}"'
-    run_root(cmd)
-
-# --- MODULE 9: CONFIGURATION SUBSYSTEM MENU ---
-def module_config_menu():
-    settings = load_json(SETTINGS_FILE, {
-        "check_method": "Online",
-        "queue_next": True,
-        "check_timeout": 60,
-        "delay_open": 5,
-        "clear_cache": False,
-        "time_to_stop": 30
-    })
-
-    while True:
-        print(CLR + f"{CYAN}{BOLD}=== MODULE 9: SYSTEM CONFIGURATIONS ==={RESET}")
-        print(f"  1. Check Method        : {GREEN}{settings['check_method']}{RESET}")
-        print(f"  2. Queue Next Instance : {GREEN}{settings['queue_next']}{RESET}")
-        print(f"  3. Check Timeout       : {GREEN}{settings['check_timeout']}s{RESET}")
-        print(f"  4. Delay Open Interval : {GREEN}{settings['delay_open']}s{RESET}")
-        print(f"  5. Flush App Cache     : {GREEN}{settings['clear_cache']}{RESET}")
-        print(f"  6. Periodic Master Stop: {GREEN}{settings['time_to_stop']} min{RESET}")
-        print(f"  0. Save and Exit")
-
-        ch = input(f"\n{CYAN}Select option to modify > {RESET}").strip()
-        if ch == "0":
-            break
-        elif ch == "1":
-            settings["check_method"] = "Executor" if settings["check_method"] == "Online" else "Online"
-        elif ch == "2":
-            settings["queue_next"] = not settings["queue_next"]
-        elif ch == "3":
-            val = input("Enter timeout in seconds: ").strip()
-            if val.isdigit(): settings["check_timeout"] = int(val)
-        elif ch == "4":
-            val = input("Enter delay in seconds: ").strip()
-            if val.isdigit(): settings["delay_open"] = int(val)
-        elif ch == "5":
-            settings["clear_cache"] = not settings["clear_cache"]
-        elif ch == "6":
-            val = input("Enter cycle stop time (minutes): ").strip()
-            if val.isdigit(): settings["time_to_stop"] = int(val)
-
-        save_json(SETTINGS_FILE, settings)
-
-# --- MODULE 1: AUTO REJOIN DAEMON & LIVE TUI DASHBOARD ---
-def module_auto_rejoin_daemon():
-    settings = load_json(SETTINGS_FILE, {
-        "check_method": "Online",
-        "queue_next": True,
-        "check_timeout": 60,
-        "delay_open": 5,
-        "clear_cache": False,
-        "time_to_stop": 30
-    })
-    packages = load_json(PACKAGES_FILE, [])
-    sessions = load_json(SESSIONS_FILE, {})
-    games_cfg = load_json(GAMES_FILE, {})
-
-    if not packages:
-        print(f"{RED}[-] Active package pool is empty. Configure Module 2 first.{RESET}")
-        time.sleep(2)
-        return
-
-    # User input for cycle limit
-    print(CLR + f"{CYAN}{BOLD}=== MODULE 1: REJOIN DAEMON SCHEDULER ==={RESET}")
-    print(f"Saved master cycle timeout: {YELLOW}{settings.get('time_to_stop', 30)} min{RESET}")
-    val_in = input("Time to stop roblox: xx (phút) [Enter to skip]: ").strip()
-    if val_in.isdigit():
-        settings["time_to_stop"] = int(val_in)
-        save_json(SETTINGS_FILE, settings)
-
-    cycle_limit_sec = settings["time_to_stop"] * 60
-    cycle_start = time.time()
-
-    # Map package to account credentials
-    account_keys = list(sessions.keys())
-    package_map = {}
-    for i, pkg in enumerate(packages):
-        acc = sessions[account_keys[i % len(account_keys)]] if account_keys else None
-        package_map[pkg] = {
-            "account": acc,
-            "status": "Starting",
-            "launch_ts": 0.0,
-            "runtime_ts": 0.0,
-            "online": False
-        }
-        if acc:
-            inject_session_to_package(pkg, acc["cookie"])
-
-    client = RobloxClient()
-
-    # Instance launcher queue controller
-    for pkg in packages:
-        package_map[pkg]["status"] = "Injecting"
-        package_map[pkg]["launch_ts"] = time.time()
-        launch_roblox_package(pkg, settings, games_cfg)
-
-        if settings.get("queue_next", True):
-            # Block until validated or timed out
-            tout = settings.get("check_timeout", 60)
-            t_start = time.time()
-            while time.time() - t_start < tout:
-                time.sleep(2.0)
-                acc = package_map[pkg]["account"]
-                if acc:
-                    csrf = client.get_csrf(acc["cookie"])
-                    pres = client.get_presence(acc["cookie"], csrf, acc["userId"])
-                    if pres and pres.get("userPresenceType") == 2:
-                        package_map[pkg]["status"] = "In-Game (Stable)"
-                        package_map[pkg]["runtime_ts"] = time.time()
-                        break
-        time.sleep(settings.get("delay_open", 5))
-
-    # Main Monitor Engine Loop
-    while True:
-        elapsed = time.time() - cycle_start
-        remaining = max(0, cycle_limit_sec - elapsed)
-        if remaining == 0:
-            # Trigger cyclic reset
-            for pkg in packages:
-                run_root(f"am force-stop {pkg}")
-            break
-
-        cpu_usage = HardwareMonitor.read_cpu_usage()
-        ram_pct, ram_used, ram_total = HardwareMonitor.read_ram_usage()
-
-        # Update and poll presence status
-        for pkg, data in package_map.items():
-            acc = data["account"]
-            if not acc:
-                data["status"] = "Unauthenticated"
-                continue
-
-            csrf = client.get_csrf(acc["cookie"])
-            pres = client.get_presence(acc["cookie"], csrf, acc["userId"])
-            if pres and pres.get("userPresenceType") == 2:
-                data["status"] = "In-Game (Stable)"
-                if data["runtime_ts"] == 0.0:
-                    data["runtime_ts"] = time.time()
-            else:
-                # Check for crash or launch timeout
-                if time.time() - data["launch_ts"] > settings.get("check_timeout", 60):
-                    data["status"] = "Timeout/Rejoining"
-                    run_root(f"am force-stop {pkg}")
-                    time.sleep(1.0)
-                    data["launch_ts"] = time.time()
-                    launch_roblox_package(pkg, settings, games_cfg)
-
-        # ANSI Render Output
-        sys.stdout.write("\033[H")
-        sys.stdout.write(f"{CYAN}{BOLD}==================== SIEUVIP TUI DAEMON MONITOR ===================={RESET}\n")
-        sys.stdout.write(f" CPU Usage: {GREEN}{cpu_usage}%{RESET} | RAM: {GREEN}{ram_pct}%{RESET} ({ram_used}MB/{ram_total}MB) | Reset In: {YELLOW}{int(remaining)}s{RESET}\n")
-        sys.stdout.write(f" Check Mode: {WHITE}{settings['check_method']}{RESET} | Queue Mode: {WHITE}{settings['queue_next']}{RESET}\n")
-        sys.stdout.write("--------------------------------------------------------------------\n")
-        sys.stdout.write(f"{BOLD}{'Package Name':<28} | {'Username':<14} | {'Status':<18} | {'Uptime'}{RESET}\n")
-        sys.stdout.write("--------------------------------------------------------------------\n")
-
-        for pkg, data in package_map.items():
-            u_name = data["account"]["username"] if data["account"] else "None"
-            st_color = GREEN if "Stable" in data["status"] else (YELLOW if "Injecting" in data["status"] else RED)
-            uptime_str = f"{int(time.time() - data['runtime_ts'])}s" if data["runtime_ts"] > 0 else "0s"
-            sys.stdout.write(f" {pkg:<27} | {u_name:<14} | {st_color}{data['status']:<18}{RESET} | {uptime_str}\n")
-
-        sys.stdout.write("--------------------------------------------------------------------\n")
-        sys.stdout.write(f"{DIM}[Ctrl+C to abort daemon and halt monitoring]{RESET}\n")
-        sys.stdout.flush()
-        time.sleep(2.0)
-
-# --- MAIN TUI CONTROL CENTER ---
-def main_menu():
-    if os.geteuid() != 0:
-        run_root("echo 1")  # Prime root context
-
-    while True:
-        print(CLR + f"{CYAN}{BOLD}===================================================={RESET}")
-        print(f"{GREEN}{BOLD}      SIEUVIP: PRODUCTION ROOT TERMUX DAEMON         {RESET}")
-        print(f"{CYAN}{BOLD}===================================================={RESET}")
-        print(f"  {YELLOW}1.{RESET} Auto Rejoin Daemon & Live TUI Dashboard")
-        print(f"  {YELLOW}2.{RESET} Package Selector Engine")
-        print(f"  {YELLOW}3.{RESET} Game ID & VIP Server Manager")
-        print(f"  {YELLOW}4.{RESET} Mutual Anti-Collision (Auto Block Pool)")
-        print(f"  {YELLOW}5.{RESET} Cookie Login & Gateway Validator")
-        print(f"  {YELLOW}6.{RESET} Export Authenticated Cookies")
-        print(f"  {YELLOW}7.{RESET} Multi-Window Grid Tiler (Freeform / WM)")
-        print(f"  {YELLOW}8.{RESET} Direct Open All Roblox Instances")
-        print(f"  {YELLOW}9.{RESET} System Configurations Subsystem")
-        print(f"  {YELLOW}10.{RESET} Autoexecute Synchronization Dispatcher")
-        print(f"  {RED}0. Exit Daemon{RESET}")
-        print(f"{CYAN}===================================================={RESET}")
-
-        opt = input(f"{CYAN}Enter selection [0-10] > {RESET}").strip()
-        if opt == "0":
-            sys.exit(0)
-        elif opt == "1": module_auto_rejoin_daemon()
-        elif opt == "2": module_package_selector()
-        elif opt == "3": module_games_manager()
-        elif opt == "4": module_mutual_anti_collision()
-        elif opt == "5": module_cookie_validator()
-        elif opt == "6": module_export_cookies()
-        elif opt == "7": module_auto_sort_tabs()
-        elif opt == "8":
-            s = load_json(SETTINGS_FILE, {})
-            g = load_json(GAMES_FILE, {})
-            pkgs = load_json(PACKAGES_FILE, [])
-            for p in pkgs:
-                launch_roblox_package(p, s, g)
-                time.sleep(s.get("delay_open", 5))
-        elif opt == "9": module_config_menu()
-        elif opt == "10":
-            sync_autoexecute()
-            print(f"{GREEN}[+] Synchronized Autoexecute scripts to all executor workspaces.{RESET}")
-            time.sleep(1.5)
+def check_alive():
+    try:
+        url = f"http://127.0.0.1:{{PORT}}/ping?userid={{USER_ID}}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except:
+        return False
 
 if __name__ == "__main__":
+    while True:
+        time.sleep(5)
+"""
+    file_path = os.path.join(WORKERS_DIR, f"{user_id}.py")
     try:
-        main_menu()
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(worker_code)
+        run_cmd(f"chmod 755 '{file_path}'")
+    except Exception:
+        pass
+
+
+def start_ipc_server(port):
+    server = ThreadedHTTPServer(("127.0.0.1", port), HeartbeatHandler)
+    t = threading.Thread(target=server.serve_forever)
+    t.daemon = True
+    t.start()
+    return server
+
+
+# -----------------------------------------------------------------------------
+# 8. ANDROID 10 FREEFORM MULTI-WINDOW MANAGER
+# -----------------------------------------------------------------------------
+def get_screen_resolution():
+    res = run_cmd("wm size", check_output=True)
+    m = re.search(r"(\d+)x(\d+)", res)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 1080, 2400  # Fallback default
+
+
+def enable_freeform_system():
+    run_cmd("settings put global enable_freeform_support 1")
+    run_cmd("settings put global force_resizable_activities 1")
+
+
+def calculate_window_bounds(index, total, mode):
+    """
+    Calculate Android 10 Freeform bounding boxes: (left, top, right, bottom)
+    Mode 1: Equal division across display.
+    Mode 2: Ultra-small grid.
+    """
+    w, h = get_screen_resolution()
+    if total <= 1:
+        return (0, 0, w, h)
+
+    if mode == 2:
+        # Ultra Small Mode: Fixed mini tiles
+        tile_w = min(400, w // 2)
+        tile_h = min(600, h // 3)
+        cols = max(1, w // tile_w)
+        col = index % cols
+        row = index // cols
+        l = col * tile_w
+        t = row * tile_h
+        return (l, t, l + tile_w, t + tile_h)
+    else:
+        # Full Screen Grid Mode
+        if total == 2:
+            rows, cols = 2, 1
+        elif total <= 4:
+            rows, cols = 2, 2
+        elif total <= 6:
+            rows, cols = 3, 2
+        else:
+            rows, cols = (total + 1) // 2, 2
+
+        cell_w = w // cols
+        cell_h = h // rows
+
+        col = index % cols
+        row = index // rows
+        l = col * cell_w
+        t = row * cell_h
+        return (l, t, l + cell_w, t + cell_h)
+
+
+# -----------------------------------------------------------------------------
+# 9. ROBLOX LAUNCHER & URL PARSER
+# -----------------------------------------------------------------------------
+def parse_roblox_url(raw_input):
+    """Extract placeId and linkCode from raw ID, VIP link, or share code."""
+    raw = raw_input.strip()
+    if raw.isdigit():
+        return raw, ""
+
+    place_id = ""
+    link_code = ""
+
+    # Check placeId
+    m_pid = re.search(r"games/(\d+)", raw)
+    if m_pid:
+        place_id = m_pid.group(1)
+    else:
+        m_pid2 = re.search(r"placeId=(\d+)", raw)
+        if m_pid2:
+            place_id = m_pid2.group(1)
+
+    # Check VIP / Private Server Code
+    m_code = re.search(r"privateServerLinkCode=([a-zA-Z0-9_\-]+)", raw)
+    if m_code:
+        link_code = m_code.group(1)
+    else:
+        m_code2 = re.search(r"code=([a-zA-Z0-9_\-]+)", raw)
+        if m_code2:
+            link_code = m_code2.group(1)
+        else:
+            m_code3 = re.search(r"linkCode=([a-zA-Z0-9_\-]+)", raw)
+            if m_code3:
+                link_code = m_code3.group(1)
+
+    return place_id, link_code
+
+
+def launch_roblox_app(package, place_id, link_code="", bounds=None):
+    """Launch package using View Intent, Freeform Mode & Multi-task flags."""
+    if link_code:
+        deep_link = f"roblox://placeId={place_id}&linkCode={link_code}"
+    else:
+        deep_link = f"roblox://placeId={place_id}"
+
+    cmd = (
+        f"am start -n {package}/com.roblox.client.Activity "
+        f"-a android.intent.action.VIEW "
+        f"-d \"{deep_link}\" "
+        f"-f 0x18000000"  # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_MULTIPLE_TASK
+    )
+
+    if bounds:
+        l, t, r, b = bounds
+        cmd += f" --windowingMode 5 --bounds {l},{t},{r},{b}"
+
+    run_cmd(cmd)
+
+
+# -----------------------------------------------------------------------------
+# 10. SYSTEM WATCHDOGS (LOGCAT & BLACK SCREEN)
+# -----------------------------------------------------------------------------
+DISCONNECT_CODES = ["277", "268", "279", "264", "529", "524"]
+
+def logcat_monitor_thread():
+    """Real-time logcat inspection for disconnect errors."""
+    run_cmd("logcat -c")
+    p = subprocess.Popen(
+        ["su", "-c", "logcat -v brief -b main -b events"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="ignore"
+    )
+
+    while not STOP_REQUESTED.is_set():
+        line = p.stdout.readline()
+        if not line:
+            time.sleep(0.1)
+            continue
+
+        for code in DISCONNECT_CODES:
+            if f"Error {code}" in line or f"Disconnect ({code})" in line or f"error code: {code}" in line.lower():
+                # Identify which package triggered the logcat event
+                for u_id, worker in list(RUNNING_WORKERS.items()):
+                    log_crash(u_id, f"Logcat phat hien ma loi: {code}")
+                    worker.status = f"Rejoining (Error {code})"
+                    worker.script_active = False
+
+                    # Trigger Discord notification
+                    send_discord_embed(
+                        "Canh bao: Mat ket noi Game",
+                        f"Tai khoan **{worker.username}** (ID: `{u_id}`) bi ngat ket noi voi ma loi: `{code}`.\nDang tien hanh Rejoin...",
+                        15158332
+                    )
+                    run_cmd(f"am force-stop {worker.package}")
+                    time.sleep(1)
+                    # Rejoin logic will be picked up by main watchdog loop
+                break
+
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def check_black_screen_or_anr(package):
+    """Check if SurfaceView rendered within window manager."""
+    dump = run_cmd(f"dumpsys window visible-apps", check_output=True)
+    if package in dump and "SurfaceView" not in dump and "Application Not Responding" in dump:
+        return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# 11. SCRIPT AUTOEXECUTE MANAGER
+# -----------------------------------------------------------------------------
+def sync_lua_script(custom_lua_content):
+    """Wrap script with heartbeat reporter and deploy across all executors."""
+    rand_name = "script_" + "".join(random.choices(string.hexdigits.lower(), k=6)) + ".txt"
+    src_file = os.path.join(AUTOEXEC_DIR, rand_name)
+
+    # Prepend dynamic Lua Heartbeat IPC stub
+    heartbeat_stub = """-- [SieuVip Auto Heartbeat Stub]
+task.spawn(function()
+    local HttpService = game:GetService("HttpService")
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+    local userId = tostring(LocalPlayer.UserId)
+    
+    local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+    if not req then return end
+    
+    while task.wait(5) do
+        pcall(function()
+            for port = 20000, 20030 do
+                req({
+                    Url = "http://127.0.0.1:" .. port .. "/ping?userid=" .. userId,
+                    Method = "GET"
+                })
+            end
+        end)
+    end
+end)
+-- [End Heartbeat Stub]
+
+"""
+    full_content = heartbeat_stub + custom_lua_content
+
+    # Save to SieuVip Autoexecute
+    with open(src_file, "w", encoding="utf-8") as f:
+        f.write(full_content)
+    run_cmd(f"chmod 666 '{src_file}'")
+
+    # Clean old scripts and sync to active executor directories
+    synced_count = 0
+    for ed in EXECUTOR_DIRS:
+        run_cmd(f"rm -rf '{ed}'/*")
+        target_path = os.path.join(ed, rand_name)
+        run_cmd(f"cp '{src_file}' '{target_path}'")
+        run_cmd(f"chmod 666 '{target_path}'")
+        synced_count += 1
+
+    return rand_name, synced_count
+
+
+# -----------------------------------------------------------------------------
+# 12. CORE EXECUTION: [1] AUTO REJOIN & LIVE MONITOR
+# -----------------------------------------------------------------------------
+def render_live_monitor(start_epoch, duration_mins):
+    """ANSI Live Monitor Dashboard."""
+    total_sec = duration_mins * 60
+    elapsed = int(time.time() - start_epoch)
+    remain = max(0, total_sec - elapsed)
+    rem_m, rem_s = divmod(remain, 60)
+
+    # Fetch CPU & RAM stats
+    mem_info = run_cmd("cat /proc/meminfo", check_output=True)
+    mem_total_m = re.search(r"MemTotal:\s+(\d+)", mem_info)
+    mem_free_m = re.search(r"MemAvailable:\s+(\d+)", mem_info)
+
+    ram_used = 0
+    ram_free = 0
+    if mem_total_m and mem_free_m:
+        t_kb = int(mem_total_m.group(1))
+        a_kb = int(mem_free_m.group(1))
+        ram_free = a_kb // 1024
+        ram_used = (t_kb - a_kb) // 1024
+
+    os.system("clear")
+    print(f"{C_CYAN}{'='*80}{C_RESET}")
+    print(
+        f"{C_BOLD}{C_WHITE}[TUT MONITOR]{C_RESET} "
+        f"RAM: {C_YELLOW}Used {ram_used}MB / Free {ram_free}MB{C_RESET} | "
+        f"Dem nguoc: {C_GREEN}{rem_m:02d}:{rem_s:02d}{C_RESET}"
+    )
+    print(f"{C_CYAN}{'='*80}{C_RESET}")
+    print(f"{C_BOLD}{'STT':<4} | {'Package':<23} | {'UserId':<12} | {'Username':<15} | {'Status'}{C_RESET}")
+    print(f"{'-'*80}")
+
+    idx = 1
+    for u_id, w in RUNNING_WORKERS.items():
+        status_color = C_GREEN if "In Game" in w.status else (C_RED if "Rejoining" in w.status else C_YELLOW)
+        print(f"{idx:<4} | {w.package:<23} | {w.user_id:<12} | {w.username:<15} | {status_color}{w.status}{C_RESET}")
+        idx += 1
+
+    print(f"{C_CYAN}{'='*80}{C_RESET}")
+    print(f"{C_WHITE}Nhan Ctrl+C de dung chu trinh va quay ve Menu chinh.{C_RESET}")
+
+
+def execute_auto_rejoin_pipeline():
+    cfg = load_config()
+    selected_pkgs = cfg.get("selected_packages", [])
+    if not selected_pkgs:
+        print(f"{C_RED}[!] Chua chon package nao tai muc [2]. Vui long chon package truoc.{C_RESET}")
+        time.sleep(2)
+        return
+
+    # Step 1: Timer prompt
+    saved_time = cfg.get("settings", {}).get("time_to_stop_mins", 360)
+    print(f"\n{C_YELLOW}[?] Time to stop roblox: {saved_time} (phut), Enter de su dung: {C_RESET}", end="")
+    user_t = input().strip()
+    if user_t.isdigit() and int(user_t) > 0:
+        stop_mins = int(user_t)
+        cfg["settings"]["time_to_stop_mins"] = stop_mins
+        save_config(cfg)
+    else:
+        stop_mins = saved_time
+
+    settings = cfg.get("settings", {})
+    delay_open = settings.get("delay_open_sec", 8)
+    timeout_sec = settings.get("timeout_sec", 60)
+    queue_next = settings.get("queue_next", True)
+    clear_cache = settings.get("clear_cache", False)
+    sort_mode = cfg.get("sort_tab_mode", 1)
+
+    enable_freeform_system()
+
+    STOP_REQUESTED.clear()
+    RUNNING_WORKERS.clear()
+
+    # Step 2: Setup Workers & HTTP IPC
+    accounts = cfg.get("accounts", {})
+    server_port = 20000
+    ipc_server = start_ipc_server(server_port)
+
+    # Initialize worker instances
+    idx = 0
+    for pkg in selected_pkgs:
+        acc = accounts.get(pkg, {})
+        u_id = acc.get("user_id", f"User_{idx+1}")
+        u_name = acc.get("username", f"Player_{idx+1}")
+        w = WorkerState(u_id, u_name, pkg, server_port)
+        RUNNING_WORKERS[u_id] = w
+        generate_worker_file(u_id, pkg, server_port)
+        idx += 1
+
+    # Step A: Clean up existing instances
+    for pkg in selected_pkgs:
+        run_cmd(f"am force-stop {pkg}")
+
+    # Step B: Auto Cross-Block if enabled
+    if cfg.get("auto_block", False):
+        run_cross_blocking(accounts)
+
+    # Launch background logcat watchdog
+    global WATCHDOG_THREAD
+    WATCHDOG_THREAD = threading.Thread(target=logcat_monitor_thread)
+    WATCHDOG_THREAD.daemon = True
+    WATCHDOG_THREAD.start()
+
+    # Send Discord Run Notification
+    field_data = []
+    for u_id, w in RUNNING_WORKERS.items():
+        field_data.append({"name": w.username, "value": f"ID: `{u_id}`\nPkg: `{w.package}`", "inline": True})
+    send_discord_embed("Khoi dong Auto Rejoin", f"Bat dau chuong trinh chay tren {len(selected_pkgs)} tai khoan.", 3066993, field_data)
+
+    start_cycle_epoch = time.time()
+    last_periodic_discord = time.time()
+
+    try:
+        # Step D: Sequential Launch Loop
+        total_pkgs = len(selected_pkgs)
+        for i, pkg in enumerate(selected_pkgs):
+            acc = accounts.get(pkg, {})
+            u_id = acc.get("user_id", f"User_{i+1}")
+            worker = RUNNING_WORKERS[u_id]
+
+            if clear_cache:
+                run_cmd(f"rm -rf /data/data/{pkg}/cache/*")
+
+            # Determine Place ID & Link Code
+            if cfg.get("game_mode") == "per_package":
+                p_game = cfg.get("package_games", {}).get(pkg, {})
+                p_id = p_game.get("place_id", "2753915549")
+                l_code = p_game.get("link_code", "")
+            else:
+                p_id = cfg.get("global_game", {}).get("place_id", "2753915549")
+                l_code = cfg.get("global_game", {}).get("link_code", "")
+
+            bounds = calculate_window_bounds(i, total_pkgs, sort_mode) if sort_mode > 0 else None
+            worker.status = "Starting App..."
+            worker.launch_time = time.time()
+
+            launch_roblox_app(pkg, p_id, l_code, bounds)
+
+            if queue_next:
+                worker.status = "Waiting Queue..."
+                # Poll until worker receives valid script ping or hits timeout
+                wait_start = time.time()
+                while time.time() - wait_start < timeout_sec:
+                    render_live_monitor(start_cycle_epoch, stop_mins)
+                    if worker.script_active:
+                        break
+                    time.sleep(1)
+            else:
+                time.sleep(delay_open)
+
+        # Step 3: Main Active Monitoring Loop
+        while not STOP_REQUESTED.is_set():
+            now = time.time()
+
+            # Check Total Session Timer
+            if (now - start_cycle_epoch) >= (stop_mins * 60):
+                print(f"\n{C_YELLOW}[*] Het thoi gian phien ({stop_mins} phut). Tien hanh Restart toan bo...{C_RESET}")
+                for pkg in selected_pkgs:
+                    run_cmd(f"am force-stop {pkg}")
+                time.sleep(3)
+                start_cycle_epoch = time.time()
+                # Re-trigger pipeline
+                for i, pkg in enumerate(selected_pkgs):
+                    acc = accounts.get(pkg, {})
+                    u_id = acc.get("user_id", f"User_{i+1}")
+                    worker = RUNNING_WORKERS[u_id]
+                    worker.script_active = False
+                    bounds = calculate_window_bounds(i, total_pkgs, sort_mode) if sort_mode > 0 else None
+                    launch_roblox_app(pkg, p_id, l_code, bounds)
+                    time.sleep(delay_open)
+
+            # Check individual workers for timeout/freeze
+            for u_id, worker in RUNNING_WORKERS.items():
+                # If script was active but heartbeats stopped
+                if worker.script_active and (now - worker.last_ping > timeout_sec):
+                    worker.status = "Timeout (Script Frozen)"
+                    worker.script_active = False
+                    log_crash(u_id, f"Heartbeat timeout qua {timeout_sec}s")
+                    run_cmd(f"am force-stop {worker.package}")
+                    time.sleep(1)
+                    # Rejoin
+                    worker.status = "Rejoining..."
+                    worker.launch_time = now
+                    bounds = calculate_window_bounds(0, total_pkgs, sort_mode) if sort_mode > 0 else None
+                    launch_roblox_app(worker.package, p_id, l_code, bounds)
+
+                # Check black screen logo freeze after 40s
+                if not worker.script_active and (now - worker.launch_time > 40):
+                    if check_black_screen_or_anr(worker.package):
+                        worker.status = "ANR / Logo Stuck"
+                        log_crash(u_id, "Treo Logo hoac man hinh den qua 40s")
+                        run_cmd(f"am force-stop {worker.package}")
+                        time.sleep(1)
+                        launch_roblox_app(worker.package, p_id, l_code, bounds)
+                        worker.launch_time = now
+
+            # Periodic 30m Discord report
+            if now - last_periodic_discord >= 1800:
+                last_periodic_discord = now
+                report_fields = []
+                for u_id, w in RUNNING_WORKERS.items():
+                    report_fields.append({"name": w.username, "value": f"Trang thai: `{w.status}`", "inline": True})
+                send_discord_embed("Bao cao dinh ky (30 Phut)", "He thong dang van hanh on dinh.", 3447003, report_fields)
+
+            render_live_monitor(start_cycle_epoch, stop_mins)
+            time.sleep(1.5)
+
     except KeyboardInterrupt:
-        print(f"\n{RED}[!] Daemon aborted by operator.{RESET}")
-        sys.exit(0)
+        print(f"\n{C_YELLOW}[*] Dang dung he thong va giai phong tien trinh...{C_RESET}")
+    finally:
+        STOP_REQUESTED.set()
+        for pkg in selected_pkgs:
+            run_cmd(f"am force-stop {pkg}")
+        try:
+            ipc_server.shutdown()
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# 13. MENU HANDLERS (MODULES [2] TO [11])
+# -----------------------------------------------------------------------------
+def menu_choose_packages():
+    """[2] Scan and select Roblox packages (Global, VNG, Clones)."""
+    cfg = load_config()
+    print(f"\n{C_CYAN}[*] Dang quet danh sach package trong he thong...{C_RESET}")
+    raw_pkgs = run_cmd("pm list packages", check_output=True).splitlines()
+    roblox_pkgs = []
+
+    for line in raw_pkgs:
+        p = line.replace("package:", "").strip()
+        if "roblox" in p.lower() or "clone" in p.lower():
+            roblox_pkgs.append(p)
+
+    if not roblox_pkgs:
+        # If no specific clone string matched, allow all Roblox matches
+        roblox_pkgs = [p.replace("package:", "").strip() for p in raw_pkgs if "roblox" in p.lower()]
+
+    roblox_pkgs = sorted(list(set(roblox_pkgs)))
+
+    while True:
+        os.system("clear")
+        selected = cfg.get("selected_packages", [])
+        print(f"{C_BOLD}{C_GREEN}=== [2] CHON PACKAGE ROBLOX / VNG / CLONE ==={C_RESET}")
+        print(f"{C_YELLOW}[A] Chon tat ca package{C_RESET}")
+        print(f"{C_YELLOW}[0] Luu va Quay lai{C_RESET}\n")
+
+        for idx, p in enumerate(roblox_pkgs, 1):
+            check_box = f"{C_GREEN}[X]{C_RESET}" if p in selected else f"{C_RED}[ ]{C_RESET}"
+            print(f"{idx:2d}. {check_box} {p}")
+
+        print(f"\n{C_WHITE}Nhap cac so can chon (VD: 1,2,4), 'A' de chon het, '0' de luu: {C_RESET}", end="")
+        inp = input().strip()
+
+        if inp == "0":
+            save_config(cfg)
+            break
+        elif inp.upper() == "A":
+            cfg["selected_packages"] = list(roblox_pkgs)
+            save_config(cfg)
+            print(f"{C_GREEN}[+] Da chon tat ca.{C_RESET}")
+            time.sleep(1)
+        else:
+            parts = re.split(r"[, ]+", inp)
+            for part in parts:
+                if part.isdigit():
+                    num = int(part)
+                    if 1 <= num <= len(roblox_pkgs):
+                        target_p = roblox_pkgs[num - 1]
+                        if target_p in cfg["selected_packages"]:
+                            cfg["selected_packages"].remove(target_p)
+                        else:
+                            cfg["selected_packages"].append(target_p)
+            save_config(cfg)
+
+
+def menu_set_game_id():
+    """[3] Configure Place ID or VIP Server link."""
+    cfg = load_config()
+    os.system("clear")
+    print(f"{C_BOLD}{C_GREEN}=== [3] CAU HINH GAME ID / VIP SERVER ==={C_RESET}")
+    print("1. Cau hinh chung cho tat ca package")
+    print("2. Cau hinh rieng cho tung package")
+    print("0. Quay lai")
+    opt = input("\nChon che do: ").strip()
+
+    if opt == "1":
+        print(f"\n{C_CYAN}--- DANH SACH 10 GAME HOT ---{C_RESET}")
+        for idx, (g_name, g_id) in enumerate(HOT_GAMES, 1):
+            print(f"{idx:2d}. {g_name} ({g_id})")
+        print("11. Tu nhap Place ID hoac URL VIP Server")
+
+        g_choice = input("\nChon game hoac nhap link: ").strip()
+        if g_choice.isdigit() and 1 <= int(g_choice) <= 10:
+            p_id = HOT_GAMES[int(g_choice) - 1][1]
+            l_code = ""
+        else:
+            p_id, l_code = parse_roblox_url(g_choice)
+
+        cfg["game_mode"] = "global"
+        cfg["global_game"] = {"place_id": p_id, "link_code": l_code}
+        save_config(cfg)
+        print(f"{C_GREEN}[+] Da luu: PlaceID={p_id}, LinkCode={l_code}{C_RESET}")
+        time.sleep(1.5)
+
+    elif opt == "2":
+        cfg["game_mode"] = "per_package"
+        selected = cfg.get("selected_packages", [])
+        if not selected:
+            print(f"{C_RED}[!] Vui long chon package truoc o muc [2].{C_RESET}")
+            time.sleep(1.5)
+            return
+
+        for pkg in selected:
+            print(f"\n{C_YELLOW}Package: {pkg}{C_RESET}")
+            raw = input("Nhap Game ID hoac VIP Server URL: ").strip()
+            p_id, l_code = parse_roblox_url(raw)
+            cfg["package_games"][pkg] = {"place_id": p_id, "link_code": l_code}
+
+        save_config(cfg)
+        print(f"{C_GREEN}[+] Da luu cau hinh rieng cho tung package.{C_RESET}")
+        time.sleep(1.5)
+
+
+def menu_login_with_cookie():
+    """[5] Read /sdcard/Download/cookie.txt, inject into selected packages."""
+    cfg = load_config()
+    selected = cfg.get("selected_packages", [])
+    if not selected:
+        print(f"{C_RED}[!] Vui long chon package o muc [2] truoc khi inject cookie.{C_RESET}")
+        time.sleep(2)
+        return
+
+    if not os.path.exists(COOKIE_SRC_FILE):
+        print(f"{C_RED}[!] Khong tim thay file: {COOKIE_SRC_FILE}{C_RESET}")
+        time.sleep(2)
+        return
+
+    with open(COOKIE_SRC_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        cookies = [line.strip() for line in f if line.strip()]
+
+    if not cookies:
+        print(f"{C_RED}[!] File cookie.txt trong.{C_RESET}")
+        time.sleep(2)
+        return
+
+    print(f"\n{C_YELLOW}[*] Tim thay {len(cookies)} cookies. Bat dau kiem tra va inject...{C_RESET}")
+    c_idx = 0
+    for pkg in selected:
+        if c_idx >= len(cookies):
+            print(f"{C_RED}[!] Da het cookie trong danh sach.{C_RESET}")
+            break
+
+        cookie = cookies[c_idx]
+        c_idx += 1
+
+        print(f"\n{C_CYAN}[*] Dang kiem tra cookie cho {pkg}...{C_RESET}")
+        user_id, username = validate_roblox_cookie(cookie)
+
+        if not user_id:
+            print(f"{C_RED}[-] Cookie khong hop le hoac da het han. Luu vao cookie_hu.txt{C_RESET}")
+            with open(COOKIE_HU_FILE, "a", encoding="utf-8") as f_hu:
+                f_hu.write(cookie + "\n")
+            continue
+
+        print(f"{C_GREEN}[+] Xac thuc thanh cong: {username} (ID: {user_id}){C_RESET}")
+        ok, msg = inject_cookie_into_package(pkg, cookie)
+        if ok:
+            print(f"{C_GREEN}[+] Root Injection vao {pkg} hoan tat.{C_RESET}")
+            cfg["accounts"][pkg] = {
+                "cookie": cookie,
+                "user_id": user_id,
+                "username": username
+            }
+            save_config(cfg)
+        else:
+            print(f"{C_RED}[-] Injection that bai: {msg}{C_RESET}")
+
+    time.sleep(2)
+
+
+def menu_export_cookie():
+    """[6] Export cookies from active config to file."""
+    cfg = load_config()
+    accounts = cfg.get("accounts", {})
+    if not accounts:
+        print(f"{C_RED}[!] Chua co tai khoan nao duoc luu.{C_RESET}")
+        time.sleep(1.5)
+        return
+
+    date_str = datetime.datetime.now().strftime("%d%m%Y")
+    export_file = os.path.join(BASE_DIR, f"cookie_export_{date_str}.txt")
+
+    print(f"\n{C_BOLD}=== [6] XUAT COOKIE ==={C_RESET}")
+    print("1. Xuat cookie theo tung tab/package")
+    print("2. Xuat toan bo cookie da luu")
+    opt = input("Chon che do: ").strip()
+
+    lines_to_write = []
+    if opt == "1":
+        pkgs = list(accounts.keys())
+        for idx, p in enumerate(pkgs, 1):
+            print(f"{idx}. {p} ({accounts[p].get('username', 'N/A')})")
+        c = input("Chon so: ").strip()
+        if c.isdigit() and 1 <= int(c) <= len(pkgs):
+            target_pkg = pkgs[int(c) - 1]
+            lines_to_write.append(accounts[target_pkg].get("cookie", ""))
+    else:
+        for acc in accounts.values():
+            if "cookie" in acc:
+                lines_to_write.append(acc["cookie"])
+
+    if lines_to_write:
+        with open(export_file, "a", encoding="utf-8") as f:
+            for l in lines_to_write:
+                f.write(l + "\n")
+        run_cmd(f"chmod 666 '{export_file}'")
+        print(f"{C_GREEN}[+] Da xuat {len(lines_to_write)} cookie vao: {export_file}{C_RESET}")
+    else:
+        print(f"{C_YELLOW}[!] Khong co cookie nao duoc xuat.{C_RESET}")
+    time.sleep(2)
+
+
+def menu_auto_sort_tab():
+    """[7] Freeform grid layout selection."""
+    cfg = load_config()
+    print(f"\n{C_BOLD}{C_GREEN}=== [7] CHIA LAYOUT MAN HINH (FREEFORM GRID) ==={C_RESET}")
+    print("1. Lam nho toan man hinh (Chia deu luoi display)")
+    print("2. Che do cuc nho (Mini Tile Grid toi uu RAM)")
+    print("0. Tat Freeform (Chay toan man hinh mac dinh)")
+    c = input("\nChon che do: ").strip()
+    if c in ["0", "1", "2"]:
+        cfg["sort_tab_mode"] = int(c)
+        save_config(cfg)
+        print(f"{C_GREEN}[+] Da cap nhat che do chia layout.{C_RESET}")
+    time.sleep(1.5)
+
+
+def menu_open_all_tabs():
+    """[8] Open all selected packages once without rejoin loop."""
+    cfg = load_config()
+    selected = cfg.get("selected_packages", [])
+    if not selected:
+        print(f"{C_RED}[!] Chua chon package tai muc [2].{C_RESET}")
+        time.sleep(1.5)
+        return
+
+    enable_freeform_system()
+    sort_mode = cfg.get("sort_tab_mode", 1)
+    total = len(selected)
+
+    print(f"\n{C_CYAN}[*] Dang khoi dong dong loat {total} package...{C_RESET}")
+    for i, pkg in enumerate(selected):
+        p_id = cfg.get("global_game", {}).get("place_id", "2753915549")
+        l_code = cfg.get("global_game", {}).get("link_code", "")
+        bounds = calculate_window_bounds(i, total, sort_mode) if sort_mode > 0 else None
+        launch_roblox_app(pkg, p_id, l_code, bounds)
+        time.sleep(cfg.get("settings", {}).get("delay_open_sec", 6))
+
+    print(f"{C_GREEN}[+] Da mo xong tat ca cac tab.{C_RESET}")
+    time.sleep(2)
+
+
+def menu_configs():
+    """[9] Detailed configuration manager."""
+    cfg = load_config()
+    s = cfg.get("settings", {})
+
+    while True:
+        os.system("clear")
+        print(f"{C_BOLD}{C_GREEN}=== [9] CAU HINH HE THONG (CONFIGS) ==={C_RESET}")
+        print(f"1. Check method: {C_YELLOW}{s.get('check_method')}{C_RESET} (Executor / Online)")
+        print(f"2. Hang cho tiep theo (Queue Next): {C_YELLOW}{s.get('queue_next')}{C_RESET}")
+        print(f"3. Check time out: {C_YELLOW}{s.get('timeout_sec')}s{C_RESET}")
+        print(f"4. Delay open: {C_YELLOW}{s.get('delay_open_sec')}s{C_RESET}")
+        print(f"5. Clear cache: {C_YELLOW}{s.get('clear_cache')}{C_RESET}")
+        print(f"6. Time to stop: {C_YELLOW}{s.get('time_to_stop_mins')} phut{C_RESET}")
+        print(f"0. Luu & Quay lai")
+
+        c = input("\nChon muc can sua: ").strip()
+        if c == "0":
+            save_config(cfg)
+            break
+        elif c == "1":
+            s["check_method"] = "Online" if s.get("check_method") == "Executor" else "Executor"
+        elif c == "2":
+            s["queue_next"] = not s.get("queue_next", True)
+        elif c == "3":
+            val = input("Nhap timeout (giay): ").strip()
+            if val.isdigit(): s["timeout_sec"] = int(val)
+        elif c == "4":
+            val = input("Nhap delay open (giay): ").strip()
+            if val.isdigit(): s["delay_open_sec"] = int(val)
+        elif c == "5":
+            s["clear_cache"] = not s.get("clear_cache", False)
+        elif c == "6":
+            val = input("Nhap time to stop (phut): ").strip()
+            if val.isdigit(): s["time_to_stop_mins"] = int(val)
+        save_config(cfg)
+
+
+def menu_autoexecute_manager():
+    """[10] Lua Script Manager."""
+    os.system("clear")
+    print(f"{C_BOLD}{C_GREEN}=== [10] AUTOEXECUTE SCRIPT MANAGER ==={C_RESET}")
+    print("Nhap/Dan doan ma Lua can chay (Nhap 'EOF' o dong rieng de hoan tat):")
+    lines = []
+    while True:
+        try:
+            line = input()
+            if line.strip() == "EOF":
+                break
+            lines.append(line)
+        except EOFError:
+            break
+
+    lua_code = "\n".join(lines)
+    if not lua_code.strip():
+        print(f"{C_YELLOW}[!] Noi dung script trong. Khong co thay doi.{C_RESET}")
+        time.sleep(1.5)
+        return
+
+    rand_name, count = sync_lua_script(lua_code)
+    print(f"{C_GREEN}[+] Da sinh file: {rand_name}{C_RESET}")
+    print(f"{C_GREEN}[+] Da dong bo thanh cong toi {count} thu muc executor.{C_RESET}")
+    time.sleep(2)
+
+
+def menu_discord_webhook():
+    """[11] Discord Webhook Configuration."""
+    cfg = load_config()
+    d = cfg.get("discord", {})
+    os.system("clear")
+    print(f"{C_BOLD}{C_GREEN}=== [11] DISCORD WEBHOOK QUAN TRI TU XA ==={C_RESET}")
+    print(f"Webhook URL: {C_YELLOW}{d.get('webhook_url') or 'Chua cau hinh'}{C_RESET}")
+    print(f"Trang thai: {C_GREEN if d.get('enabled') else C_RED}{'BAT' if d.get('enabled') else 'TAT'}{C_RESET}")
+    print("\n1. Nhap/Doi Webhook URL")
+    print("2. Bat/Tat thong bao")
+    print("3. Gui thu nghiem (Test Webhook)")
+    print("0. Quay lai")
+
+    c = input("\nChon muc: ").strip()
+    if c == "1":
+        url = input("Nhap Discord Webhook URL: ").strip()
+        d["webhook_url"] = url
+        save_config(cfg)
+    elif c == "2":
+        d["enabled"] = not d.get("enabled", False)
+        save_config(cfg)
+    elif c == "3":
+        send_discord_embed("Test Webhook", "Day la tin nhan thu nghiem tu Tool SieuVip Termux.", 65280)
+        print(f"{C_GREEN}[+] Da gui request test.{C_RESET}")
+        time.sleep(1.5)
+
+
+# -----------------------------------------------------------------------------
+# 14. MAIN TERMINAL DASHBOARD INTERFACE
+# -----------------------------------------------------------------------------
+def display_main_menu():
+    cfg = load_config()
+    selected_count = len(cfg.get("selected_packages", []))
+    acc_count = len(cfg.get("accounts", {}))
+
+    os.system("clear")
+    print(f"{C_RED}{C_BOLD}")
+    print(r"  ███████╗██╗███████╗██╗   ██╗    ██╗   ██╗██╗██████╗ ")
+    print(r"  ██╔════╝██║██╔════╝██║   ██║    ██║   ██║██║██╔══██╗")
+    print(r"  ███████╗██║█████╗  ██║   ██║    ██║   ██║██║██████╔╝")
+    print(r"  ╚════██║██║██╔══╝  ██║   ██║    ╚██╗ ██╔╝██║██╔═══╝ ")
+    print(r"  ███████║██║███████╗╚██████╔╝     ╚████╔╝ ██║██║     ")
+    print(r"  ╚══════╝╚═╝╚══════╝ ╚═════╝       ╚═══╝  ╚═╝╚═╝     ")
+    print(f"{C_RESET}")
+    print(f"{C_CYAN}================================================================================{C_RESET}")
+    print(f"{C_WHITE} He thong: Android 10 (Root) | Packages da chon: {C_GREEN}{selected_count}{C_WHITE} | Accs: {C_GREEN}{acc_count}{C_RESET}")
+    print(f"{C_CYAN}================================================================================{C_RESET}")
+    print(f" {C_GREEN}[1]{C_RESET} {C_BOLD}Auto Rejoin (Khoi dong chu trinh da tien trinh cày VIP){C_RESET}")
+    print(f" {C_WHITE}[2] Chon Package (Global, VNG, App Cloner){C_RESET}")
+    print(f" {C_WHITE}[3] Nhap Game ID hoac Server VIP (Tich hop 10 Game Hot){C_RESET}")
+    print(f" {C_WHITE}[4] Auto Block Account (Chan cheo phong ngua trung server){C_RESET}")
+    print(f" {C_WHITE}[5] Login with Cookie (Root XML / SQLite Injection){C_RESET}")
+    print(f" {C_WHITE}[6] Export Cookie{C_RESET}")
+    print(f" {C_WHITE}[7] Auto Sort Tab (Android 10 Freeform Multi-Window Grid){C_RESET}")
+    print(f" {C_WHITE}[8] Open All Tabs Roblox{C_RESET}")
+    print(f" {C_WHITE}[9] Configs (Timer, Delay, Timeout, Cache, Heartbeat){C_RESET}")
+    print(f" {C_WHITE}[10] Autoexecute Script Manager (Lua Sync IPC){C_RESET}")
+    print(f" {C_WHITE}[11] Discord Webhook (Canh bao va bao cao tu xa){C_RESET}")
+    print(f" {C_RED}[0] Thoat he thong{C_RESET}")
+    print(f"{C_CYAN}================================================================================{C_RESET}")
+    print(f"{C_YELLOW}Vui long nhap lua chon cua ban [0-11]: {C_RESET}", end="")
+
+
+def main():
+    check_and_enforce_root()
+    init_directories()
+
+    while True:
+        display_main_menu()
+        choice = input().strip()
+
+        if choice == "1":
+            execute_auto_rejoin_pipeline()
+        elif choice == "2":
+            menu_choose_packages()
+        elif choice == "3":
+            menu_set_game_id()
+        elif choice == "4":
+            cfg = load_config()
+            cfg["auto_block"] = not cfg.get("auto_block", False)
+            save_config(cfg)
+            print(f"{C_GREEN}[+] Trang thai Auto Block: {cfg['auto_block']}{C_RESET}")
+            time.sleep(1.5)
+        elif choice == "5":
+            menu_login_with_cookie()
+        elif choice == "6":
+            menu_export_cookie()
+        elif choice == "7":
+            menu_auto_sort_tab()
+        elif choice == "8":
+            menu_open_all_tabs()
+        elif choice == "9":
+            menu_configs()
+        elif choice == "10":
+            menu_autoexecute_manager()
+        elif choice == "11":
+            menu_discord_webhook()
+        elif choice == "0":
+            print(f"\n{C_GREEN}[*] Da dong toan bo he thong. Tam biet boss man!{C_RESET}\n")
+            sys.exit(0)
+        else:
+            print(f"\n{C_RED}[!] Lua chon khong hop le.{C_RESET}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
